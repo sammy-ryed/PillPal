@@ -1,0 +1,72 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cream: #F7F3EE;
+  --color-parchment: #EDE7DC;
+  --color-sage: #7A9E8E;
+  --color-sage-light: #B8D4C8;
+  --color-sage-dark: #4A7060;
+  --color-terra: #C45C3A;
+  --color-terra-light: #E8967C;
+  --color-charcoal: #2A2520;
+  --color-warm-gray: #8A837A;
+
+  --font-serif: var(--font-serif);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --radius-sm: 4px;
+  --radius-DEFAULT: 8px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans, "DM Sans", sans-serif);
+  background-color: var(--color-cream);
+  color: var(--color-charcoal);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* Transitions */
+.page-enter {
+  animation: fadein 0.3s ease both;
+}
+@keyframes fadein {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Pending pulse */
+@keyframes pulse-ring {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(196, 92, 58, 0.3); }
+  50%       { box-shadow: 0 0 0 6px rgba(196, 92, 58, 0); }
+}
+.pulse-ring {
+  animation: pulse-ring 1.6s ease infinite;
+}
+
+/* Scan line */
+@keyframes scanline {
+  0%   { top: 0; }
+  100% { top: 100%; }
+}
+.scan-line {
+  animation: scanline 2s ease-in-out infinite;
+}
+
+/* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner        { animation: spin 1s linear infinite; }
+.spinner-inner  { animation: spin 1.8s linear infinite reverse; }

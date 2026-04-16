@@ -17,6 +17,11 @@ numpy>=1.26.0
 easyocr>=1.7.1
 pytesseract>=0.3.10
 
+# Optional Donut fallback OCR (install only when USE_DONUT_FALLBACK=true)
+# transformers>=4.40.0
+# torch>=2.2.0
+# sentencepiece>=0.2.0
+
 # ── NLP / fuzzy matching ───────────────────────────────────────────────────────
 rapidfuzz>=3.6.0
 

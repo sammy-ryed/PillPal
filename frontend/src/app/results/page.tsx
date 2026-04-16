@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { usePrescription } from "@/store/prescription-context";
 import { generateReminders } from "@/lib/api";
@@ -338,11 +338,28 @@ function ScanLine() {
 
 function UploadedPreview({ file }: { file: File }) {
   const [src, setSrc] = useState<string | null>(null);
-  if (!src) {
+
+  useEffect(() => {
+    let isMounted = true;
     const reader = new FileReader();
-    reader.onload = (e) => setSrc(e.target?.result as string);
+
+    reader.onload = (e) => {
+      if (isMounted) {
+        setSrc(e.target?.result as string);
+      }
+    };
+
     reader.readAsDataURL(file);
-  }
+
+    return () => {
+      isMounted = false;
+      reader.onload = null;
+      if (reader.readyState === FileReader.LOADING) {
+        reader.abort();
+      }
+    };
+  }, [file]);
+
   return src ? (
     <img src={src} alt="Prescription" style={{ width: "100%", height: "100%", objectFit: "contain", padding: 8 }} />
   ) : (

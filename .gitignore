@@ -11,6 +11,7 @@ Thumbs.db
 **/*.py[cod]
 backend/venv/
 backend/.venv/
+backend/models/
 
 # Local env files
 .env

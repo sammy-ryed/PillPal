@@ -37,11 +37,15 @@ class ImagePreprocessor:
     """Stateless image preprocessor. Call preprocess() with raw image bytes."""
 
     MAX_DIMENSION = 2400  # Resize if either side exceeds this
+    MIN_TEXT_H = 900
+    MIN_TEXT_W = 1200
 
     def preprocess(self, image_bytes: bytes) -> List[ProcessedVariant]:
         """Return a list of variants ordered by expected quality (best first)."""
         img = self._load(image_bytes)
         img = self._exif_rotate(image_bytes, img)
+        img = self._crop_to_text_region(img)
+        img = self._upscale_small_text(img)
         img = self._resize(img)
         img = self._deskew(img)
 
@@ -84,6 +88,103 @@ class ImagePreprocessor:
             new_w, new_h = int(w * scale), int(h * scale)
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         return img
+
+    def _crop_to_text_region(self, img: np.ndarray) -> np.ndarray:
+        """
+        Remove oversized blank margins and keep only the text-rich region.
+
+        Helpful for captures where prescription text occupies a small area of a
+        large canvas (common in screenshots/camera app exports).
+        """
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            inv = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                41,
+                15,
+            )
+
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+            inv = cv2.dilate(inv, kernel, iterations=2)
+
+            contours, _ = cv2.findContours(inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return img
+
+            h, w = gray.shape[:2]
+            min_area = max(80, int(h * w * 0.00003))
+            boxes: List[Tuple[int, int, int, int]] = []
+
+            for contour in contours:
+                x, y, bw, bh = cv2.boundingRect(contour)
+                area = bw * bh
+                if area < min_area:
+                    continue
+                if bw < 10 or bh < 8:
+                    continue
+                boxes.append((x, y, bw, bh))
+
+            if not boxes:
+                return img
+
+            x1 = min(x for x, _, _, _ in boxes)
+            y1 = min(y for _, y, _, _ in boxes)
+            x2 = max(x + bw for x, _, bw, _ in boxes)
+            y2 = max(y + bh for _, y, _, bh in boxes)
+
+            bw = x2 - x1
+            bh = y2 - y1
+            box_ratio = (bw * bh) / float(w * h)
+
+            # Ignore near-full-image boxes or tiny noise-only boxes.
+            if box_ratio > 0.90:
+                return img
+            if bw < int(w * 0.10) and bh < int(h * 0.08):
+                return img
+
+            pad = int(max(bw, bh) * 0.10) + 12
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(w, x2 + pad)
+            y2 = min(h, y2 + pad)
+
+            cropped = img[y1:y2, x1:x2]
+            if cropped.size == 0:
+                return img
+
+            logger.debug(
+                f"Auto-cropped text region: ({x1},{y1})-({x2},{y2}) "
+                f"ratio={((x2 - x1) * (y2 - y1)) / float(w * h):.3f}"
+            )
+            return cropped
+        except Exception as exc:
+            logger.warning(f"Auto-crop failed: {exc}")
+            return img
+
+    def _upscale_small_text(self, img: np.ndarray) -> np.ndarray:
+        """
+        Upscale small crops so OCR engines receive larger glyphs.
+        """
+        h, w = img.shape[:2]
+        if h >= self.MIN_TEXT_H and w >= self.MIN_TEXT_W:
+            return img
+
+        scale_h = self.MIN_TEXT_H / max(h, 1)
+        scale_w = self.MIN_TEXT_W / max(w, 1)
+        scale = max(scale_h, scale_w, 1.0)
+        scale = min(scale, 3.0)
+
+        if scale <= 1.05:
+            return img
+
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        upscaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        logger.debug(f"Upscaled text region by {scale:.2f}x to {new_w}x{new_h}.")
+        return upscaled
 
     def _deskew(self, img: np.ndarray) -> np.ndarray:
         """Detect and correct skew angle using Hough line transform."""

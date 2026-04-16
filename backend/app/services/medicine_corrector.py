@@ -32,9 +32,13 @@ _SUBS: List[Tuple[str, str]] = [
     ("0",  "o"),  # zero → o
     ("1",  "l"),  # one  → l
     ("1",  "i"),  # one  → i
+    ("2",  "z"),
+    ("4",  "a"),
     ("5",  "s"),  # five → s
     ("6",  "g"),  # six  → g (less common but happens)
+    ("7",  "t"),
     ("8",  "b"),  # eight → b
+    ("9",  "g"),
     ("|",  "l"),  # pipe → l
     ("vv", "w"),
     ("rn", "m"),
@@ -54,6 +58,11 @@ _STRIP_DOSAGE = re.compile(
     r"\s+\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|iu|%|mmol)\b.*$",
     re.IGNORECASE,
 )
+
+# OCR often emits noisy long numbers like "50070" instead of "500mg".
+_STRIP_TRAILING_NUMERIC_NOISE = re.compile(r"\s+\d{4,}\b.*$", re.IGNORECASE)
+
+_MIN_GUESS_SCORE = 45.0
 
 
 @dataclass
@@ -93,6 +102,7 @@ class MedicineCorrector:
         # Pre-clean: strip dosage form prefix + dosage suffix
         cleaned = _STRIP_PREFIXES.sub("", raw_name).strip()
         cleaned = _STRIP_DOSAGE.sub("", cleaned).strip()
+        cleaned = _STRIP_TRAILING_NUMERIC_NOISE.sub("", cleaned).strip()
 
         if not cleaned:
             cleaned = raw_name
@@ -103,12 +113,30 @@ class MedicineCorrector:
         # Fuzzy match all candidates, keep the best hit
         best_name, best_score, _ = self._best_match(candidates)
 
-        if best_score is None or best_score < self._threshold:
+        if best_score is None:
+            return CorrectionResult(
+                original=raw_name,
+                corrected=raw_name,
+                score=0.0,
+                is_uncertain=True,
+            )
+
+        if best_score < self._threshold:
+            # Even when below threshold, keep a low-confidence guess if it's not
+            # too weak. This gives users a better starting point for manual edits.
+            if best_name and best_score >= _MIN_GUESS_SCORE:
+                return CorrectionResult(
+                    original=raw_name,
+                    corrected=best_name,
+                    score=float(best_score),
+                    is_uncertain=True,
+                )
+
             # Return original (cleaned) but flag as uncertain
             return CorrectionResult(
                 original=raw_name,
                 corrected=raw_name,
-                score=float(best_score or 0),
+                score=float(best_score),
                 is_uncertain=True,
             )
 
@@ -133,6 +161,11 @@ class MedicineCorrector:
                 candidates.add(variant)
                 # Also try replacing all occurrences
                 candidates.add(lower.replace(bad, good))
+
+        # OCR-safe alpha form for cases like "Faracenamui 50070".
+        alpha_only = re.sub(r"[^a-z]", "", lower)
+        if len(alpha_only) >= 4:
+            candidates.add(alpha_only)
 
         return list(candidates)
 

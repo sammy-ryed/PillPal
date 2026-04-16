@@ -50,9 +50,11 @@ Open `.env` and fill in **your** Supabase project URL and anon key:
 ```
 SUPABASE_URL=https://xxxxx.supabase.co
 SUPABASE_KEY=your-supabase-key-here
+HF_TOKEN=hf_xxx_optional_for_donut
 ```
 
 > **No Supabase?** Leave both blank. The backend falls back to a built-in dataset of 200+ Indian medicines. OCR still works fully.
+> **Using Donut fallback?** Add `HF_TOKEN` to avoid unauthenticated Hugging Face Hub throttling.
 
 ### Seed the database (optional, one-time)
 
@@ -146,6 +148,7 @@ taskkill /PID <PID> /F
 | `Connection refused` in browser | Backend isn't running — start uvicorn first |
 | `CORS error` | CORS is set to `*` by default — check `backend/app/config.py` → `allowed_origins` |
 | EasyOCR first run takes 2–3 min | It's downloading model weights. Happens only once. |
+| "You are sending unauthenticated requests to the HF Hub" | Add `HF_TOKEN` in `backend/.env` or set it in shell env before starting backend |
 | Low OCR confidence warnings | Better lighting + flat surface + full prescription in frame |
 | `Module not found` on Next.js | Run `npm install` inside `frontend/` |
 | Supabase 401 error | Check that `SUPABASE_KEY` is the **anon** key, not the password |

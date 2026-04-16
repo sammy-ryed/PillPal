@@ -8,8 +8,11 @@ GET  /api/medicines               — List all medicines in DB (with optional ?q
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from typing import List, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, Depends
@@ -18,13 +21,14 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, get_settings
 from app.models.prescription import MedicineEntry, PrescriptionResult
 from app.models.reminder import ReminderPlan
+from app.services.donut_ocr import get_donut_fallback_engine
 from app.services.image_preprocessor import ImagePreprocessor
 from app.services.medicine_corrector import MedicineCorrector
 from app.services.ocr_engine import OCREngineManager
 from app.services.prescription_parser import PrescriptionParser
 from app.services.reminder_generator import ReminderGenerator
 from app.services.supabase_service import get_supabase_service
-from app.services.text_merger import merge
+from app.services.text_merger import MergedResult, merge
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,6 +42,58 @@ _preprocessor = ImagePreprocessor()
 _reminder_gen = ReminderGenerator()
 
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff"}
+
+_PIPELINE_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_PIPELINE_CACHE_LOCK = Lock()
+
+
+def _make_cache_key(image_bytes: bytes, settings: Settings) -> str:
+    sig = "|".join(
+        [
+            str(settings.use_easyocr),
+            str(settings.use_tesseract),
+            str(settings.use_donut_fallback),
+            str(settings.ocr_fast_mode),
+            str(settings.ocr_max_variants_per_engine),
+            str(settings.ocr_early_stop_confidence),
+            str(settings.ocr_skip_tesseract_confidence),
+            str(settings.ocr_confidence_threshold),
+            str(settings.donut_fallback_trigger_confidence),
+            settings.donut_model_id,
+        ]
+    )
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    settings_hash = hashlib.sha1(sig.encode("utf-8")).hexdigest()
+    return f"{image_hash}:{settings_hash}"
+
+
+def _cache_get_result(cache_key: str) -> Optional[PrescriptionResult]:
+    with _PIPELINE_CACHE_LOCK:
+        payload = _PIPELINE_CACHE.get(cache_key)
+        if payload is None:
+            return None
+        _PIPELINE_CACHE.move_to_end(cache_key)
+    return PrescriptionResult.model_validate(payload)
+
+
+def _cache_put_result(cache_key: str, result: PrescriptionResult, max_size: int) -> None:
+    payload = result.model_dump(mode="json")
+    with _PIPELINE_CACHE_LOCK:
+        _PIPELINE_CACHE[cache_key] = payload
+        _PIPELINE_CACHE.move_to_end(cache_key)
+        while len(_PIPELINE_CACHE) > max_size:
+            _PIPELINE_CACHE.popitem(last=False)
+
+
+def _result_rank(result: PrescriptionResult) -> tuple[int, int, float]:
+    """
+    Rank parsed results by usefulness:
+    1) more medicines, 2) more certain medicines, 3) higher confidence.
+    """
+    total = len(result.medicines)
+    uncertain = sum(1 for med in result.medicines if med.is_uncertain)
+    certain = total - uncertain
+    return (total, certain, result.overall_confidence)
 
 
 def _run_pipeline(image_bytes: bytes, settings: Settings) -> PrescriptionResult:
@@ -60,6 +116,10 @@ def _run_pipeline(image_bytes: bytes, settings: Settings) -> PrescriptionResult:
     engine_mgr = OCREngineManager(
         use_easyocr=settings.use_easyocr,
         use_tesseract=settings.use_tesseract,
+        fast_mode=settings.ocr_fast_mode,
+        max_variants_per_engine=settings.ocr_max_variants_per_engine,
+        early_stop_confidence=settings.ocr_early_stop_confidence,
+        skip_tesseract_confidence=settings.ocr_skip_tesseract_confidence,
     )
     ocr_results = engine_mgr.run(variants)
 
@@ -82,6 +142,63 @@ def _run_pipeline(image_bytes: bytes, settings: Settings) -> PrescriptionResult:
         image_quality=quality,
         start_time=start,
     )
+
+    uncertain_ratio = (
+        (sum(1 for med in result.medicines if med.is_uncertain) / len(result.medicines))
+        if result.medicines
+        else 1.0
+    )
+
+    should_try_donut = (
+        settings.use_donut_fallback
+        and (
+            not result.medicines
+            or result.overall_confidence <= settings.donut_fallback_trigger_confidence
+            or uncertain_ratio >= 0.80
+        )
+    )
+
+    if should_try_donut:
+        donut_engine = get_donut_fallback_engine()
+        donut = donut_engine.extract(
+            image_bytes=image_bytes,
+            model_id=settings.donut_model_id,
+            max_length=settings.donut_max_length,
+            hf_token=settings.hf_token,
+        )
+
+        if donut and donut.text.strip():
+            logger.info(
+                f"Trying Donut fallback: model={donut.model_id} "
+                f"text_len={len(donut.text)} t={donut.elapsed_ms:.0f}ms"
+            )
+
+            donut_merged = MergedResult(
+                text=donut.text,
+                avg_confidence=max(result.overall_confidence, settings.donut_assumed_confidence),
+                engines_used=["donut"],
+                primary_engine="donut",
+            )
+
+            donut_result = parser.parse(
+                merged=donut_merged,
+                preprocessing_variants=[v.name for v in variants] + ["donut_fallback"],
+                image_quality=quality,
+                start_time=start,
+            )
+
+            if _result_rank(donut_result) > _result_rank(result):
+                donut_result.warnings.append(
+                    "Donut fallback OCR was used to recover low-confidence handwriting. "
+                    "Please review medicines before confirming reminders."
+                )
+                result = donut_result
+                logger.info(
+                    f"Donut fallback selected: meds={len(result.medicines)} "
+                    f"conf={result.overall_confidence:.2f}"
+                )
+            else:
+                logger.info("Donut fallback did not improve extraction; keeping primary OCR result.")
 
     return result
 
@@ -114,19 +231,38 @@ async def parse_prescription(
     if len(image_bytes) < 1000:
         raise HTTPException(status_code=400, detail="File is too small or corrupt.")
 
-    try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            _executor, _run_pipeline, image_bytes, settings
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception as exc:
-        logger.error(f"Pipeline error: {exc}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Prescription processing failed. Please try again with a clearer image.",
-        )
+    cache_key = ""
+    if settings.enable_parse_cache:
+        cache_key = _make_cache_key(image_bytes, settings)
+        cached = _cache_get_result(cache_key)
+        if cached is not None:
+            logger.info(
+                f"Parse cache hit: key={cache_key[:12]} meds={len(cached.medicines)} "
+                f"conf={cached.overall_confidence:.2f}"
+            )
+            result = cached
+        else:
+            result = None
+    else:
+        result = None
+
+    if result is None:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                _executor, _run_pipeline, image_bytes, settings
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.error(f"Pipeline error: {exc}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Prescription processing failed. Please try again with a clearer image.",
+            )
+
+        if settings.enable_parse_cache and cache_key:
+            _cache_put_result(cache_key, result, settings.parse_cache_size)
 
     # Persist to Supabase asynchronously (non-blocking — failure doesn't break response)
     try:

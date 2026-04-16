@@ -87,6 +87,14 @@ _FORM_PREFIX = re.compile(
     re.IGNORECASE,
 )
 
+# Hints that a noisy line may still be a medicine entry.
+_FALLBACK_HINT_RE = re.compile(
+    r"\b(?:tab(?:let)?|cap(?:sule)?|inj(?:ection)?|syr(?:up)?|susp(?:ension)?|"
+    r"drop|mg|mcg|ml|iu|od|bd|tds|qid|bid|tid|hs|sos|prn|am|pm)\b|"
+    r"\b\d\s*[-–]\s*\d\s*[-–]\s*\d\b",
+    re.IGNORECASE,
+)
+
 
 class PrescriptionParser:
 
@@ -133,11 +141,24 @@ class PrescriptionParser:
             if entry:
                 medicine_entries.append(entry)
 
+        # If strict pass finds nothing, try a lenient salvage pass.
+        # This keeps difficult handwritten prescriptions usable instead of empty.
+        fallback_used = False
+        if not medicine_entries:
+            medicine_entries = self._fallback_extract_medicines(lines, merged.avg_confidence)
+            fallback_used = len(medicine_entries) > 0
+
         # ── Warnings ───────────────────────────────────────────────────────────
         if merged.avg_confidence < self._threshold:
             warnings.append(
                 f"Low OCR confidence ({merged.avg_confidence:.0%}). "
                 "Results may be inaccurate — please review carefully."
+            )
+
+        if fallback_used:
+            warnings.append(
+                "Automatic fallback extraction was used due to weak OCR signal. "
+                "Please verify medicine names before confirming reminders."
             )
 
         uncertain_count = sum(1 for e in medicine_entries if e.is_uncertain)
@@ -293,6 +314,53 @@ class PrescriptionParser:
         for pattern, _ in _TIMING_PATTERNS:
             line = re.sub(pattern, "", line, flags=re.IGNORECASE).strip()
         return line
+
+    def _fallback_extract_medicines(self, lines: List[str], base_conf: float) -> List[MedicineEntry]:
+        """
+        Lenient fallback extraction for difficult handwritten scans.
+
+        Runs only when strict parsing returns zero medicines. It accepts weaker
+        line signals but marks all recovered entries as uncertain for manual review.
+        """
+        recovered: List[MedicineEntry] = []
+        seen: set[str] = set()
+
+        for line in lines:
+            stripped = line.strip()
+            if len(stripped) < 6:
+                continue
+            if any(p.match(stripped) for p in _SKIP_PATTERNS):
+                continue
+            if _DOCTOR_RE.search(stripped) or _PATIENT_RE.search(stripped) or _HOSPITAL_RE.search(stripped):
+                continue
+
+            score = self._line_score(stripped)
+            if score < 1 and not _FALLBACK_HINT_RE.search(stripped):
+                continue
+
+            entry = self._parse_medicine_line(stripped, base_conf)
+            if not entry:
+                continue
+
+            key = (entry.corrected_name or entry.name).strip().lower()
+            if not key or key in seen:
+                continue
+
+            entry.is_uncertain = True
+            entry.confidence = min(entry.confidence, 0.45)
+            if entry.times_per_day <= 0:
+                entry.times_per_day = 1
+            if not entry.reminder_times:
+                entry.reminder_times = ["08:00"]
+
+            recovered.append(entry)
+            seen.add(key)
+
+            # Keep output manageable; users can re-run on cropped images for more.
+            if len(recovered) >= 8:
+                break
+
+        return recovered
 
     @staticmethod
     def _extract_first(text: str, pattern: re.Pattern) -> str:

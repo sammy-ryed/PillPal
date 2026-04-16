@@ -9,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.routers import health, prescriptions
 from app.services.medicine_corrector import MedicineCorrector
-from app.services.ocr_engine import prewarm_ocr
 from app.services.frequency_parser import FrequencyParser
 from app.services.supabase_service import SupabaseService, set_supabase_service
 from app.utils.logger import get_logger
@@ -28,9 +27,6 @@ async def lifespan(app: FastAPI):
 
     MedicineCorrector.initialize(svc)
     FrequencyParser.initialize(svc)
-
-    if settings.prewarm_ocr_on_startup:
-        prewarm_ocr(use_easyocr=settings.use_easyocr)
 
     logger.info("PillPal API ready.")
     yield

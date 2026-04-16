@@ -266,25 +266,12 @@ class OCREngineManager:
     that passes 0.1) and returns them for the text merger to resolve.
     """
 
-    def __init__(
-        self,
-        use_easyocr: bool = True,
-        use_tesseract: bool = True,
-        fast_mode: bool = True,
-        max_variants_per_engine: int = 2,
-        early_stop_confidence: float = 0.58,
-        skip_tesseract_confidence: float = 0.68,
-    ) -> None:
+    def __init__(self, use_easyocr: bool = True, use_tesseract: bool = True) -> None:
         self._engines = []
         if use_easyocr:
             self._engines.append(_easyocr_singleton)
         if use_tesseract:
             self._engines.append(_tesseract_singleton)
-
-        self._fast_mode = fast_mode
-        self._max_variants_per_engine = max(1, max_variants_per_engine)
-        self._early_stop_confidence = early_stop_confidence
-        self._skip_tesseract_confidence = skip_tesseract_confidence
 
         if not self._engines:
             raise RuntimeError("No OCR engines configured. Enable at least one in settings.")
@@ -296,23 +283,13 @@ class OCREngineManager:
         result is always selected.
         """
         results: List[OCRResult] = []
-        variants_to_try = variants[: self._max_variants_per_engine] if self._fast_mode else variants
 
-        for idx, engine in enumerate(self._engines):
+        for engine in self._engines:
             best: Optional[OCRResult] = None
-            for variant in variants_to_try:
+            for variant in variants:
                 r = engine.extract(variant)
                 if r and (best is None or r.avg_confidence > best.avg_confidence):
                     best = r
-
-                if (
-                    self._fast_mode
-                    and best is not None
-                    and best.avg_confidence >= self._early_stop_confidence
-                    and len(best.blocks) >= 2
-                ):
-                    # Confident enough on this engine; skip remaining variants.
-                    break
 
             if best:
                 logger.info(
@@ -321,28 +298,4 @@ class OCREngineManager:
                 )
                 results.append(best)
 
-                # If EasyOCR is already confident, skip slower secondary engine.
-                if (
-                    self._fast_mode
-                    and idx == 0
-                    and best.engine == "easyocr"
-                    and best.avg_confidence >= self._skip_tesseract_confidence
-                    and len(best.blocks) >= 2
-                ):
-                    logger.info(
-                        "Fast OCR mode: skipping secondary engine due to confident EasyOCR result."
-                    )
-                    break
-
         return results
-
-
-def prewarm_ocr(use_easyocr: bool = True) -> None:
-    """Warm heavy OCR components at startup so the first request is faster."""
-    if not use_easyocr:
-        return
-    try:
-        _ = _easyocr_singleton.reader
-        logger.info("EasyOCR prewarmed during startup.")
-    except Exception as exc:
-        logger.warning(f"EasyOCR prewarm failed: {exc}")
